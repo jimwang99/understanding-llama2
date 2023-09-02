@@ -1,2 +1,2 @@
 plantuml:
-	plantuml model.puml
+	plantuml model.puml -tpdf -tlatex

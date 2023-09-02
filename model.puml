@@ -1,12 +1,14 @@
 @startuml "model"
 
-title "Llama model architecture accoding to\n facebookresearch/llama/llama/model.py\n and karpathy/llama2.c/model.py"
+title "Llama model architecture accoding to facebookresearch/llama/llama/model.py and karpathy/llama2.c/model.py"
 
 skinparam CloudBorderColor White
 
 skinparam component {
     ArrowColor Red
 }
+
+skinparam NoteFontStyle italic
 
 header
 batch = B
@@ -29,7 +31,7 @@ end footer
 
 frame Transformer {
     ' Embeddings
-    () "embedding(vocab_size, D)" as embedding
+    interface "embedding(V, D)" as embedding
     [Input Embeddings\nXi (B, L, D)] as Xi
 
     Ti --> embedding
@@ -37,13 +39,13 @@ frame Transformer {
 
     frame TransformerLayer {
         ' RMS Norm
-        () "Attention Norm\nRMSNorm(dim)" as attention_norm
+        () "Attention Norm\nRMSNorm(D)" as attention_norm
         [Attention Input\nXi' (B, L, D)] as Xi1
 
         Xi --> attention_norm
         attention_norm --> Xi1
 
-        frame Attention {
+        frame "Multi-Head Attention" {
             frame Projection {
                 ' Linear projection
                 () "linear(D, D)" as projection_q
@@ -74,23 +76,28 @@ frame Transformer {
 
             frame "RoPE (Rotary Positional Embedding)" {
                 ' Reshape and unbind XQ and XK to match complex representation
-                () "reshape(..., -1, 2).unbind(-1)" as complex_q
-                () "reshape(..., -1, 2).unbind(-1)" as complex_k
+                [Q' (B, L, Nh, D/Nh/2, 2)] as Q1_
+                [K' (B, L, Nkv, D/Nh/2, 2)] as K1_
+                Q1 --> Q1_ : reshape
+                K1 --> K1_ : reshape
+
+                () "To complex\nrepresentation\nx.unbind(2)" as complex_q
+                () "To complex\nrepresentation\nx.unbind(2)" as complex_k
                 [Qc = Qr + Qi*i\nQr (B, L, Nh, D/Nh/2)\nQi (B, L, Nh, D/Nh/2)] as Qc
                 [Kc = Kr + Ki*i\nKr (B, L, Nkv, D/Nh/2)\nKi (B, L, Nkv, D/Nh/2)] as Kc
 
-                Q1 --> complex_q
-                K1 --> complex_k
+                Q1_ --> complex_q
+                K1_ --> complex_k
                 complex_q --> Qc
                 complex_k --> Kc
 
                 ' RoPE precomputed sin/cos freqs
-                database "Cos(yymθ)\n(1, L, 1, D/Nh/2)" as Cos
+                database "Cos(mθ)\n(1, L, 1, D/Nh/2)" as Cos
                 database "Sin(mθ)\n(1, L, 1, D/Nh/2)" as Sin
 
                 ' Apply rotation on complex
-                () "Broadcast dim=0,2\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q
-                () "Broadcast dim=0,2\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k
+                () "Broadcast dim=[0,2]\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q
+                () "Broadcast dim=[0,2]\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k
 
                 [Qr' (B, L, Nh, D/Nh/2)\nQi' (B, L, Nh, D/Nh/2)] as Qc1
                 [Kr' (B, L, Nkv, D/Nh/2)\nKi' (B, L, Nkv, D/Nh/2)] as Kc1
@@ -103,6 +110,7 @@ frame Transformer {
                 Sin --> rotate_k
                 rotate_q --> Qc1
                 rotate_k --> Kc1
+
 
                 ' Stack and flatten (like shuffle cards)
                 () "stack([Qr', Qi'], dim=-1).flatten(3)" as shuffle_q
@@ -151,12 +159,19 @@ frame Transformer {
                 }
 
                 frame "Scaled Dot Product Attention" {
+                    ' transpose
+                    [Kt' (B, Nh, D/Nh, L)] as Kt1
+                    () "transpose(2, 3)" as trans_kt
+
+                    Kt --> trans_kt
+                    trans_kt --> Kt1
+
                     ' matmul
-                    () "matmul(Q', K'ᵀ) / sqrt(D/Nh)" as matmul_q_k
+                    () "matmul(Q', Kt') / sqrt(D/Nh)" as matmul_q_k
                     [Attention\nA (B, Nh, L, L)] as A
 
                     Qt --> matmul_q_k
-                    Kt --> matmul_q_k : tranpose(2, 3)
+                    Kt1 --> matmul_q_k
                     matmul_q_k --> A
 
                     ' mask
@@ -213,7 +228,7 @@ frame Transformer {
         attention_residual_add --> Ha
 
         ' RMSNorm
-        () "FFN Norm\nRMSNorm(dim)" as ffn_norm
+        () "FFN Norm\nRMSNorm(-1)" as ffn_norm
         [FFN input\nHi (B, L, D)] as Hi
 
         Ha --> ffn_norm
@@ -284,5 +299,108 @@ frame ModelHead {
     output_linear --> To
 }
 
+note right of embedding
+A lookup table with 1 as input size, D as output size.
+Input value is a unsigned int in the range of [0, V).
+Output value is a vector of size D.
+end note
+
+note right of attention_norm
+Run "Root Mean Square Normalization" on dimension D
+`x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + epsilon)`
+- rsqrt means reciprocal of the square-root
+- x.mean(-1, keepdim=True) outputs shape (B, L, 1)
+end note
+
+note right of projection_v
+Vector-by-matrix multiplication
+- Vector is the dimension D of Xi'
+- Matrix is learned weights, no bias
+end note
+
+note right of Q1
+Split the last dimension D into multiple heads for Q
+The same for KV, but their # of heads are smaller than Q
+end note
+
+note right of complex_k
+Qr = {Q0, Q2, Q4, ...}
+Qi = {Q1, Q3, Q5, ...}
+
+Kr = {K0, K2, K4, ...}
+Ki = {K1, K3, K5, ...}
+end note
+
+note right of Sin
+Constants shared by all layers
+- m=[0,L)
+  - position of token in the sequence
+- θ=10000.pow(-2i/d)
+  - i=[0,d/2)
+  - d=D/Nh
+end note
+
+note right of rotate_k
+Use memory space to trade for computational complexity
+
+1. Broadcast constant matrix on dimension 0 and 2
+2. Elem-wise 4D tensor multiplication
+
+Foundamentially it is
+1. Vector-by-matrix element wise multiplication
+vector = Cos|Sin(1, ?, 1, D/Nh/2)
+matrix = Qx(?, ?, Nh, D/Nh/2)
+2. On top of 1, loop through L for both tensors
+3. On top of 2, loop through B for Qx and keep Cos|Sin the same
+end note
+
+note right of shuffle_k
+Q = {Qr0, Qi0, Qr1, Qi1, Qr2, Qi2, ...}
+K = {Kr0, Ki0, Kr1, Ki1, Kr2, Ki2, ...}
+end note
+
+note bottom of repeat_v
+Duplicate the last dimension by Nh/Nkv times
+and fold it into 2nd to last dimension
+
+Again, use memory space to trade for computational complexity
+end note
+
+note right of Qt
+Move the Nh (# of head) dimension to batch domain,
+so that scaled-dot-product is done
+on L (sequence) and D (embedding) dimensions
+end note
+
+note right of M
+Constants that are used to mask attentions
+from current tokens to future tokens,
+so that those attention value's softmax is 0,
+by adding -∞ (negative infinity)
+end note
+
+note right of softmax
+Calculate along the last dimension
+<latex>
+y_i = e^{x_i} / \sum_i{e^{x_i}}
+</latex>
+end note
+
+note right of matmul_a_v
+NOTE: V needs NO transpose
+end note
+
+note right of SAc1
+Back to (batch, sequence, embedding)
+end note
+
+note right of Hu
+Dn (hidden dimension) is ~2.5x of D
+end note
+
+note right of output_linear
+From embedding to vocabulary probability. Each number
+in the last domain represents the probability of corresponding token
+end note
 
 @enduml

@@ -1,2 +1,2 @@
-# understanding-llama2
+# Understanding Llama2
  
