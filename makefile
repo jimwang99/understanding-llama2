@@ -1,0 +1,2 @@
+plantuml:
+	plantuml model.puml

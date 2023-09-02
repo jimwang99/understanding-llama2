@@ -1,0 +1,288 @@
+@startuml "model"
+
+title "Llama model architecture accoding to\n facebookresearch/llama/llama/model.py\n and karpathy/llama2.c/model.py"
+
+skinparam CloudBorderColor White
+
+skinparam component {
+    ArrowColor Red
+}
+
+header
+batch = B
+seq_len = L
+dim = D
+n_heads = Nh
+n_kv_heads = Nkv
+hidden_dim = Dh
+n_layer = Nl
+vocab_size = V
+end header
+
+footer
+Dh = 4 * 2 * D // 3 then round-up to multiple_of
+end footer
+
+
+' Input token
+[Input tokens\nTi (B, L)] as Ti
+
+frame Transformer {
+    ' Embeddings
+    () "embedding(vocab_size, D)" as embedding
+    [Input Embeddings\nXi (B, L, D)] as Xi
+
+    Ti --> embedding
+    embedding --> Xi
+
+    frame TransformerLayer {
+        ' RMS Norm
+        () "Attention Norm\nRMSNorm(dim)" as attention_norm
+        [Attention Input\nXi' (B, L, D)] as Xi1
+
+        Xi --> attention_norm
+        attention_norm --> Xi1
+
+        frame Attention {
+            frame Projection {
+                ' Linear projection
+                () "linear(D, D)" as projection_q
+                () "linear(D, D*Nkv/Nh)" as projection_k
+                () "linear(D, D*Nkv/Nh)" as projection_v
+                [Q (B, L, D)] as Q
+                [K (B, L, D*Nkv/Nh)] as K
+                [V (B, L, D*Nkv/Nh)] as V
+
+                Xi1 --> projection_q
+                Xi1 --> projection_k
+                Xi1 --> projection_v
+
+                projection_q --> Q
+                projection_k --> K
+                projection_v --> V
+
+                ' Reshape
+                [Q' (B, L, Nh, D/Nh)] as Q1
+                [K' (B, L, Nkv, D/Nh)] as K1
+                [V' (B, L, Nkv, D/Nh)] as V1
+
+                Q --> Q1 : view
+                K --> K1 : view
+                V --> V1 : view
+            }
+            ' End of frame "Projection"
+
+            frame "RoPE (Rotary Positional Embedding)" {
+                ' Reshape and unbind XQ and XK to match complex representation
+                () "reshape(..., -1, 2).unbind(-1)" as complex_q
+                () "reshape(..., -1, 2).unbind(-1)" as complex_k
+                [Qc = Qr + Qi*i\nQr (B, L, Nh, D/Nh/2)\nQi (B, L, Nh, D/Nh/2)] as Qc
+                [Kc = Kr + Ki*i\nKr (B, L, Nkv, D/Nh/2)\nKi (B, L, Nkv, D/Nh/2)] as Kc
+
+                Q1 --> complex_q
+                K1 --> complex_k
+                complex_q --> Qc
+                complex_k --> Kc
+
+                ' RoPE precomputed sin/cos freqs
+                database "Cos(yymθ)\n(1, L, 1, D/Nh/2)" as Cos
+                database "Sin(mθ)\n(1, L, 1, D/Nh/2)" as Sin
+
+                ' Apply rotation on complex
+                () "Broadcast dim=0,2\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q
+                () "Broadcast dim=0,2\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k
+
+                [Qr' (B, L, Nh, D/Nh/2)\nQi' (B, L, Nh, D/Nh/2)] as Qc1
+                [Kr' (B, L, Nkv, D/Nh/2)\nKi' (B, L, Nkv, D/Nh/2)] as Kc1
+
+                Qc --> rotate_q
+                Cos --> rotate_q
+                Sin --> rotate_q
+                Kc --> rotate_k
+                Cos --> rotate_k
+                Sin --> rotate_k
+                rotate_q --> Qc1
+                rotate_k --> Kc1
+
+                ' Stack and flatten (like shuffle cards)
+                () "stack([Qr', Qi'], dim=-1).flatten(3)" as shuffle_q
+                () "stack([Kr', Ki'], dim=-1).flatten(3)" as shuffle_k
+                [Q'' (B, L, Nh, D/Nh)] as Q2
+                [K'' (B, L, Nkv, D/Nh)] as K2
+
+                Qc1 --> shuffle_q
+                shuffle_q --> Q2
+                Kc1 --> shuffle_k
+                shuffle_k --> K2
+            }
+            ' End of frame RoPE
+
+            frame "Grouped Multi-Query Attention" {
+
+                frame "Expand KV to match the size of Q" {
+                    ' Expand K and V for GQA (grouped multi-query attention)
+                    () "repeat_interleave\n(K'', repeats=Nh/Nkv, dim=2)" as repeat_k
+                    () "repeat_interleave\n(V', repeats=Nh/Nkv, dim=2)" as repeat_v
+                    [Kx (B, L, Nh, D/Nh)] as Kx
+                    [Vx (B, L, Nh, D/Nh)] as Vx
+
+                    K2 --> repeat_k
+                    repeat_k --> Kx
+                    V1 --> repeat_v
+                    repeat_v --> Vx
+                }
+
+                cloud {
+                    ' Transpose
+                    () "transpose(1, 2)" as trans_q
+                    () "transpose(1, 2)" as trans_k
+                    () "transpose(1, 2)" as trans_v
+
+                    [Qt (B, Nh, L, D/Nh)] as Qt
+                    [Kt (B, Nh, L, D/Nh)] as Kt
+                    [Vt (B, Nh, L, D/Nh)] as Vt
+
+                    Q2 --> trans_q
+                    Kx --> trans_k
+                    Vx --> trans_v
+                    trans_q --> Qt
+                    trans_k --> Kt
+                    trans_v --> Vt
+                }
+
+                frame "Scaled Dot Product Attention" {
+                    ' matmul
+                    () "matmul(Q', K'ᵀ) / sqrt(D/Nh)" as matmul_q_k
+                    [Attention\nA (B, Nh, L, L)] as A
+
+                    Qt --> matmul_q_k
+                    Kt --> matmul_q_k : tranpose(2, 3)
+                    matmul_q_k --> A
+
+                    ' mask
+                    database "Const mask matrix\nM (B, Nh, L, L)" as M
+                    () "Add(A, M)" as add_mask
+                    [Am (B, Nh, L, L)] as Am
+
+                    A --> add_mask
+                    M --> add_mask
+                    add_mask --> Am
+
+                    ' softmax
+                    () "softmax(Am, dim=-1)" as softmax
+                    [As (B, Nh, L, L)] as As
+
+                    Am --> softmax
+                    softmax --> As
+
+                    ' matmul
+                    () "matmul(As, Vt)" as matmul_a_v
+                    [Self-Attention\nSA(B, Nh, L, D/Nh)] as SA
+
+                    Vt --> matmul_a_v
+                    As --> matmul_a_v
+                    matmul_a_v --> SA
+                }
+                ' End of frame "Scaled Dot Product Attention"
+
+                ' concat heads
+                () "tranpose(1, 2).contiguous()" as concat_sa
+                [Self-Attention concatenated\nSAc (B, L, Nh, D/Nh)] as SAc
+                [Self-Attention concatenated\nSAc' (B, L, D)] as SAc1
+
+                SA --> concat_sa
+                concat_sa --> SAc
+                SAc --> SAc1 : view(B, L, -1)
+
+                ' Linear
+                () "linear(D, D)" as projection_sac
+                [Self-Attention projection\nSAp (B, L, D)] as SAp
+
+                SAc1 --> projection_sac
+                projection_sac --> SAp
+            }
+            ' End of frame "Grouped Multi-Query Attention"
+        }
+
+        ' Residual after attention
+        () "Attention Residual Add" as attention_residual_add
+        [Attention Residual Output\nHa (B, L, D)] as Ha
+        Xi --> attention_residual_add
+        SAp --> attention_residual_add
+
+        attention_residual_add --> Ha
+
+        ' RMSNorm
+        () "FFN Norm\nRMSNorm(dim)" as ffn_norm
+        [FFN input\nHi (B, L, D)] as Hi
+
+        Ha --> ffn_norm
+        ffn_norm --> Hi
+
+        frame FeedForward {
+            cloud {
+                () "Gate Projection\nlinear(D, Dh)" as gate_projection
+                () "Up Projection\nlinear(D, Dh)" as up_projection
+                [Hg (B, L, Dh)] as Hg
+                [Hu (B, L, Dh)] as Hu
+
+                Hi --> gate_projection
+                gate_projection --> Hg
+                Hi --> up_projection
+                up_projection --> Hu
+            }
+
+            () "swish()" as swish
+            [Hs (B, L, Dh)] as Hs
+
+            Hg --> swish
+            swish --> Hs
+
+            () "Elem-Wise Mul()" as elem_wise_mul
+            [Hm (B, L, Dh)] as Hm
+            Hu --> elem_wise_mul
+            Hs --> elem_wise_mul
+            elem_wise_mul --> Hm
+
+            () "Down Projection\nlinear(Dh, D)" as down_projection
+            [Hd (B, L, D)] as Hd
+
+            Hm --> down_projection
+            down_projection --> Hd
+        }
+        ' End of frame FeedForward
+
+        ' Residual after FFN
+        () "FNN Residual Add()" as ffn_residual_add
+        [FFN Residual Output\nHa (B, L, D)] as Hf
+        Ha --> ffn_residual_add
+        Hd --> ffn_residual_add
+        ffn_residual_add --> Hf
+    }
+
+
+    ' Loop TransformerLayer
+    () "(idx < Nl)?" as layer_loop
+
+    Hf --> layer_loop
+    layer_loop --> attention_norm : Yes
+
+    ' RMSNorm
+    () "Output Norm\nRMSNorm(D)" as output_norm
+    [Output Embeddings\nXo (B, L, D)] as Xo
+
+    layer_loop --> output_norm : No
+    output_norm --> Xo
+}
+
+frame ModelHead {
+    ' Output linear
+    () "Output Linear\nlinear(D, V)" as output_linear
+    [Output Tokens\nTo (B, L, V)] as To
+
+    Xo --> output_linear
+    output_linear --> To
+}
+
+
+@enduml
