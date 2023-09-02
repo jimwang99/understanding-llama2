@@ -8,8 +8,6 @@ skinparam component {
     ArrowColor Red
 }
 
-skinparam NoteFontStyle italic
-
 header
 batch = B
 seq_len = L
