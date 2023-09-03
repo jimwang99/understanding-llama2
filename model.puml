@@ -3,10 +3,15 @@
 title "Llama model architecture accoding to facebookresearch/llama/llama/model.py and karpathy/llama2.c/model.py"
 
 skinparam CloudBorderColor White
-
+skinparam interface {
+    BackgroundColor<<memops>> Lightblue
+    BackgroundColor<<compute>> Pink
+    BackgroundColor<<module>> Red
+}
 skinparam component {
     ArrowColor Red
 }
+
 
 header
 batch = B
@@ -29,7 +34,7 @@ end footer
 
 frame Transformer {
     ' Embeddings
-    interface "embedding(V, D)" as embedding
+    () "embedding(V, D)" as embedding <<memops>>
     [Input Embeddings\nXi (B, L, D)] as Xi
 
     Ti --> embedding
@@ -37,7 +42,7 @@ frame Transformer {
 
     frame TransformerLayer {
         ' RMS Norm
-        () "Attention Norm\nRMSNorm(D)" as attention_norm
+        () "Attention Norm\nRMSNorm(D)" as attention_norm <<module>>
         [Attention Input\nXi' (B, L, D)] as Xi1
 
         Xi --> attention_norm
@@ -46,9 +51,9 @@ frame Transformer {
         frame "Multi-Head Attention" {
             frame Projection {
                 ' Linear projection
-                () "linear(D, D)" as projection_q
-                () "linear(D, D*Nkv/Nh)" as projection_k
-                () "linear(D, D*Nkv/Nh)" as projection_v
+                () "Projection Q\nlinear(D, D)" as projection_q <<module>>
+                () "Projection K\nlinear(D, D*Nkv/Nh)" as projection_k <<module>>
+                () "Projection V\nlinear(D, D*Nkv/Nh)" as projection_v <<module>>
                 [Q (B, L, D)] as Q
                 [K (B, L, D*Nkv/Nh)] as K
                 [V (B, L, D*Nkv/Nh)] as V
@@ -79,8 +84,8 @@ frame Transformer {
                 Q1 --> Q1_ : reshape
                 K1 --> K1_ : reshape
 
-                () "To complex\nrepresentation\nx.unbind(2)" as complex_q
-                () "To complex\nrepresentation\nx.unbind(2)" as complex_k
+                () "To complex\nrepresentation\nx.unbind(-1)" as complex_q <<memops>>
+                () "To complex\nrepresentation\nx.unbind(-1)" as complex_k <<memops>>
                 [Qc = Qr + Qi*i\nQr (B, L, Nh, D/Nh/2)\nQi (B, L, Nh, D/Nh/2)] as Qc
                 [Kc = Kr + Ki*i\nKr (B, L, Nkv, D/Nh/2)\nKi (B, L, Nkv, D/Nh/2)] as Kc
 
@@ -94,8 +99,8 @@ frame Transformer {
                 database "Sin(mθ)\n(1, L, 1, D/Nh/2)" as Sin
 
                 ' Apply rotation on complex
-                () "Broadcast dim=[0,2]\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q
-                () "Broadcast dim=[0,2]\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k
+                () "Broadcast dim=[0,2]\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q <<compute>>
+                () "Broadcast dim=[0,2]\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k <<compute>>
 
                 [Qr' (B, L, Nh, D/Nh/2)\nQi' (B, L, Nh, D/Nh/2)] as Qc1
                 [Kr' (B, L, Nkv, D/Nh/2)\nKi' (B, L, Nkv, D/Nh/2)] as Kc1
@@ -111,8 +116,8 @@ frame Transformer {
 
 
                 ' Stack and flatten (like shuffle cards)
-                () "stack([Qr', Qi'], dim=-1).flatten(3)" as shuffle_q
-                () "stack([Kr', Ki'], dim=-1).flatten(3)" as shuffle_k
+                () "stack([Qr', Qi'], dim=-1).flatten(3)" as shuffle_q <<memops>>
+                () "stack([Kr', Ki'], dim=-1).flatten(3)" as shuffle_k <<memops>>
                 [Q'' (B, L, Nh, D/Nh)] as Q2
                 [K'' (B, L, Nkv, D/Nh)] as K2
 
@@ -127,8 +132,8 @@ frame Transformer {
 
                 frame "Expand KV to match the size of Q" {
                     ' Expand K and V for GQA (grouped multi-query attention)
-                    () "repeat_interleave\n(K'', repeats=Nh/Nkv, dim=2)" as repeat_k
-                    () "repeat_interleave\n(V', repeats=Nh/Nkv, dim=2)" as repeat_v
+                    () "repeat_interleave\n(K'', repeats=Nh/Nkv, dim=2)" as repeat_k <<memops>>
+                    () "repeat_interleave\n(V', repeats=Nh/Nkv, dim=2)" as repeat_v <<memops>>
                     [Kx (B, L, Nh, D/Nh)] as Kx
                     [Vx (B, L, Nh, D/Nh)] as Vx
 
@@ -140,9 +145,9 @@ frame Transformer {
 
                 cloud {
                     ' Transpose
-                    () "transpose(1, 2)" as trans_q
-                    () "transpose(1, 2)" as trans_k
-                    () "transpose(1, 2)" as trans_v
+                    () "transpose(1, 2)" as trans_q <<memops>>
+                    () "transpose(1, 2)" as trans_k <<memops>>
+                    () "transpose(1, 2)" as trans_v <<memops>>
 
                     [Qt (B, Nh, L, D/Nh)] as Qt
                     [Kt (B, Nh, L, D/Nh)] as Kt
@@ -159,13 +164,13 @@ frame Transformer {
                 frame "Scaled Dot Product Attention" {
                     ' transpose
                     [Kt' (B, Nh, D/Nh, L)] as Kt1
-                    () "transpose(2, 3)" as trans_kt
+                    () "transpose(2, 3)" as trans_kt <<memops>>
 
                     Kt --> trans_kt
                     trans_kt --> Kt1
 
                     ' matmul
-                    () "matmul(Q', Kt') / sqrt(D/Nh)" as matmul_q_k
+                    () "matmul(Qt, Kt') / sqrt(D/Nh)" as matmul_q_k <<compute>>
                     [Attention\nA (B, Nh, L, L)] as A
 
                     Qt --> matmul_q_k
@@ -174,7 +179,7 @@ frame Transformer {
 
                     ' mask
                     database "Const mask matrix\nM (B, Nh, L, L)" as M
-                    () "Add(A, M)" as add_mask
+                    () "add(A, M)" as add_mask <<compute>>
                     [Am (B, Nh, L, L)] as Am
 
                     A --> add_mask
@@ -182,14 +187,14 @@ frame Transformer {
                     add_mask --> Am
 
                     ' softmax
-                    () "softmax(Am, dim=-1)" as softmax
+                    () "softmax(Am, dim=-1)" as softmax <<compute>>
                     [As (B, Nh, L, L)] as As
 
                     Am --> softmax
                     softmax --> As
 
                     ' matmul
-                    () "matmul(As, Vt)" as matmul_a_v
+                    () "matmul(As, Vt)" as matmul_a_v <<compute>>
                     [Self-Attention\nSA(B, Nh, L, D/Nh)] as SA
 
                     Vt --> matmul_a_v
@@ -199,7 +204,7 @@ frame Transformer {
                 ' End of frame "Scaled Dot Product Attention"
 
                 ' concat heads
-                () "tranpose(1, 2).contiguous()" as concat_sa
+                () "tranpose(1, 2).contiguous()" as concat_sa <<memops>>
                 [Self-Attention concatenated\nSAc (B, L, Nh, D/Nh)] as SAc
                 [Self-Attention concatenated\nSAc' (B, L, D)] as SAc1
 
@@ -208,7 +213,7 @@ frame Transformer {
                 SAc --> SAc1 : view(B, L, -1)
 
                 ' Linear
-                () "linear(D, D)" as projection_sac
+                () "Projection A\nlinear(D, D)" as projection_sac <<module>>
                 [Self-Attention projection\nSAp (B, L, D)] as SAp
 
                 SAc1 --> projection_sac
@@ -218,7 +223,7 @@ frame Transformer {
         }
 
         ' Residual after attention
-        () "Attention Residual Add" as attention_residual_add
+        () "Attention Residual Add" as attention_residual_add <<compute>>
         [Attention Residual Output\nHa (B, L, D)] as Ha
         Xi --> attention_residual_add
         SAp --> attention_residual_add
@@ -226,7 +231,7 @@ frame Transformer {
         attention_residual_add --> Ha
 
         ' RMSNorm
-        () "FFN Norm\nRMSNorm(-1)" as ffn_norm
+        () "FFN Norm\nRMSNorm(D)" as ffn_norm <<module>>
         [FFN input\nHi (B, L, D)] as Hi
 
         Ha --> ffn_norm
@@ -234,8 +239,8 @@ frame Transformer {
 
         frame FeedForward {
             cloud {
-                () "Gate Projection\nlinear(D, Dh)" as gate_projection
-                () "Up Projection\nlinear(D, Dh)" as up_projection
+                () "Gate Projection\nlinear(D, Dh)" as gate_projection <<module>>
+                () "Up Projection\nlinear(D, Dh)" as up_projection <<module>>
                 [Hg (B, L, Dh)] as Hg
                 [Hu (B, L, Dh)] as Hu
 
@@ -245,19 +250,19 @@ frame Transformer {
                 up_projection --> Hu
             }
 
-            () "swish()" as swish
+            () "swish()" as swish <<compute>>
             [Hs (B, L, Dh)] as Hs
 
             Hg --> swish
             swish --> Hs
 
-            () "Elem-Wise Mul()" as elem_wise_mul
+            () "Elem-Wise Mul()" as elem_wise_mul <<compute>>
             [Hm (B, L, Dh)] as Hm
             Hu --> elem_wise_mul
             Hs --> elem_wise_mul
             elem_wise_mul --> Hm
 
-            () "Down Projection\nlinear(Dh, D)" as down_projection
+            () "Down Projection\nlinear(Dh, D)" as down_projection <<module>>
             [Hd (B, L, D)] as Hd
 
             Hm --> down_projection
@@ -266,8 +271,8 @@ frame Transformer {
         ' End of frame FeedForward
 
         ' Residual after FFN
-        () "FNN Residual Add()" as ffn_residual_add
-        [FFN Residual Output\nHa (B, L, D)] as Hf
+        () "FNN Residual Add(Hd, Ha)" as ffn_residual_add <<compute>>
+        [FFN Residual Output\nHf (B, L, D)] as Hf
         Ha --> ffn_residual_add
         Hd --> ffn_residual_add
         ffn_residual_add --> Hf
@@ -276,26 +281,26 @@ frame Transformer {
 
     ' Loop TransformerLayer
     () "(idx < Nl)?" as layer_loop
+    ["Input Embeddings\nXi (B, L, D)"] as _Xi
 
     Hf --> layer_loop
-    layer_loop --> attention_norm : Yes
+    layer_loop -> _Xi : Yes
 
-    ' RMSNorm
-    () "Output Norm\nRMSNorm(D)" as output_norm
-    [Output Embeddings\nXo (B, L, D)] as Xo
-
-    layer_loop --> output_norm : No
-    output_norm --> Xo
 }
 
-frame ModelHead {
-    ' Output linear
-    () "Output Linear\nlinear(D, V)" as output_linear
-    [Output Tokens\nTo (B, L, V)] as To
+' RMSNorm
+() "Output Norm\nRMSNorm(D)" as output_norm <<module>>
+[Output Embeddings\nXo (B, L, D)] as Xo
 
-    Xo --> output_linear
-    output_linear --> To
-}
+layer_loop --> output_norm : No
+output_norm --> Xo
+
+' Output linear
+() "Output Linear\nlinear(D, V)" as output_linear <<module>>
+[Output Tokens\nTo (B, L, V)] as To
+
+Xo --> output_linear
+output_linear --> To
 
 note right of embedding
 A lookup table with 1 as input size, D as output size.
@@ -401,4 +406,10 @@ From embedding to vocabulary probability. Each number
 in the last domain represents the probability of corresponding token
 end note
 
+
+note right of _Xi
+Goes back to the input of Transformer Layer.
+> Drawing the arrow will mess up PlantUML's engine
+> and make this diagram unreadable, therefore it's not shown here.
+end note
 @enduml
