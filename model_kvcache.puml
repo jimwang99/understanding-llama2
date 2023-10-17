@@ -1,0 +1,653 @@
+@startuml "model_kvcache"
+
+title "Llama model architecture with KV cache to accelerate inference efficiency"
+
+skinparam CloudBorderColor White
+skinparam interface {
+    BackgroundColor<<memops>> Lightblue
+    BackgroundColor<<compute>> Pink
+    BackgroundColor<<module>> Red
+    BackgroundColor<<out-of-scope>> Green
+}
+skinparam component {
+    ArrowColor Red
+}
+
+
+header
+B = batch
+Bm = max_batch_size
+L = seq_len
+Lm = max_seq_len
+D = dim
+Nh = n_heads = Nh
+Nkv = n_kv_heads
+Dh = hidden_dim
+Nl = n_layer
+l = layer_idx
+V = vocab_size
+Dh = round_up(8 * D // 3, multiple_of)
+Lp = prompt_seq_len
+Lc = cache_seq_len
+La = Lc+1 = attn_seq_len
+end header
+
+database "K cache buffer\nCk (Nl, Bm, Lm, Nkv, D/Nh)" as cache_k
+database "V cache buffer\nCv (Nl, Bm, Lm, Nkv, D/Nh)" as cache_v
+database "K cache buffer\nCk (Nl, Bm, Lm, Nkv, D/Nh)" as cache_k_
+database "V cache buffer\nCv (Nl, Bm, Lm, Nkv, D/Nh)" as cache_v_
+
+frame "Prefill phase" {
+    ' Input token
+    [Input tokens\nTi (B, Lp)] as Ti
+
+    frame "Transformer (prefill)" {
+        ' Embeddings
+        () "embedding(V, D)" as embedding <<memops>>
+        [Input Embeddings\nXi (B, Lp, D)] as Xi
+
+        Ti --> embedding
+        embedding --> Xi
+
+        frame "TransformerLayer (prefill)" {
+            ' RMS Norm
+            () "Attention Norm\nRMSNorm(D)" as attention_norm <<module>>
+            [Attention Input\nXi' (B, Lp, D)] as Xi1
+
+            Xi --> attention_norm
+            attention_norm --> Xi1
+
+            frame "Multi-Head Attention" {
+                frame Projection {
+                    ' Linear projection
+                    () "Projection Q\nlinear(D, D)" as projection_q <<module>>
+                    () "Projection K\nlinear(D, D*Nkv/Nh)" as projection_k <<module>>
+                    () "Projection V\nlinear(D, D*Nkv/Nh)" as projection_v <<module>>
+                    [Q (B, Lp, D)] as Q
+                    [K (B, Lp, D*Nkv/Nh)] as K
+                    [V (B, Lp, D*Nkv/Nh)] as V
+
+                    Xi1 --> projection_q
+                    Xi1 --> projection_k
+                    Xi1 --> projection_v
+
+                    projection_q --> Q
+                    projection_k --> K
+                    projection_v --> V
+
+                    ' Reshape
+                    [Q' (B, Lp, Nh, D/Nh)] as Q1
+                    [K' (B, Lp, Nkv, D/Nh)] as K1
+                    [V' (B, Lp, Nkv, D/Nh)] as V1
+
+                    Q --> Q1 : view
+                    K --> K1 : view
+                    V --> V1 : view
+                }
+                ' End of frame "Projection"
+
+                frame "RoPE (Rotary Positional Embedding) (prefill)" {
+                    ' Reshape and unbind XQ and XK to match complex representation
+                    [Q' (B, Lp, Nh, D/Nh/2, 2)] as _Q1
+                    [K' (B, Lp, Nkv, D/Nh/2, 2)] as _K1
+                    Q1 --> _Q1 : reshape
+                    K1 --> _K1 : reshape
+
+                    () "To complex\nrepresentation\nx.unbind(-1)" as complex_q <<memops>>
+                    () "To complex\nrepresentation\nx.unbind(-1)" as complex_k <<memops>>
+                    [Qc = Qr + Qi*i\nQr (B, Lp, Nh, D/Nh/2)\nQi (B, Lp, Nh, D/Nh/2)] as Qc
+                    [Kc = Kr + Ki*i\nKr (B, Lp, Nkv, D/Nh/2)\nKi (B, Lp, Nkv, D/Nh/2)] as Kc
+
+                    _Q1 --> complex_q
+                    _K1 --> complex_k
+                    complex_q --> Qc
+                    complex_k --> Kc
+
+                    ' RoPE precomputed sin/cos freqs
+                    database "Cos(mθ)\n(1, 0:Lp, 1, D/Nh/2)" as Cos
+                    database "Sin(mθ)\n(1, 0:Lp, 1, D/Nh/2)" as Sin
+
+                    ' Apply rotation on complex
+                    () "Broadcast dim=[0,2]\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q <<compute>>
+                    () "Broadcast dim=[0,2]\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k <<compute>>
+
+                    [Qr' (B, Lp, Nh, D/Nh/2)\nQi' (B, Lp, Nh, D/Nh/2)] as Qc1
+                    [Kr' (B, Lp, Nkv, D/Nh/2)\nKi' (B, Lp, Nkv, D/Nh/2)] as Kc1
+
+                    Qc --> rotate_q
+                    Cos --> rotate_q : broadcast
+                    Sin --> rotate_q : broadcast
+                    Kc --> rotate_k
+                    Cos --> rotate_k : broadcast
+                    Sin --> rotate_k : broadcast
+                    rotate_q --> Qc1
+                    rotate_k --> Kc1
+
+
+                    ' Stack and flatten (like shuffle cards)
+                    () "stack([Qr', Qi'], dim=-1).flatten(3)" as shuffle_q <<memops>>
+                    () "stack([Kr', Ki'], dim=-1).flatten(3)" as shuffle_k <<memops>>
+                    [Q'' (B, Lp, Nh, D/Nh)] as Q2
+                    [K'' (B, Lp, Nkv, D/Nh)] as K2
+
+                    Qc1 --> shuffle_q
+                    shuffle_q --> Q2
+                    Kc1 --> shuffle_k
+                    shuffle_k --> K2
+                }
+                ' End of frame RoPE
+
+                ' KV Cache
+                () "Save to cache K\nat (l, :B, :Lp, :, :)" as save_to_cache_k <<memops>>
+                () "Save to cache V\nat (l, :B, :Lp, :, :)" as save_to_cache_v <<memops>>
+                V1 --> save_to_cache_v
+                K2 --> save_to_cache_k
+                save_to_cache_k --> cache_k
+                save_to_cache_v --> cache_v
+
+                frame "Grouped Multi-Query Attention (prefill)" {
+
+                    frame "Repeat KV to match the size of Q (prefill)" {
+                        ' Repeat K and V for GQA (grouped multi-query attention)
+                        () "repeat_interleave\n(K'', repeats=Nh/Nkv, dim=2)" as repeat_k <<memops>>
+                        () "repeat_interleave\n(V', repeats=Nh/Nkv, dim=2)" as repeat_v <<memops>>
+                        [Kx (B, Lp, Nh, D/Nh)] as Kx
+                        [Vx (B, Lp, Nh, D/Nh)] as Vx
+
+                        save_to_cache_k --> repeat_k
+                        repeat_k --> Kx
+                        save_to_cache_v --> repeat_v
+                        repeat_v --> Vx
+                    }
+
+                    cloud {
+                        ' Transpose
+                        () "transpose(1, 2)" as trans_q <<memops>>
+                        () "transpose(1, 2)" as trans_k <<memops>>
+                        () "transpose(1, 2)" as trans_v <<memops>>
+
+                        [Qt (B, Nh, Lp, D/Nh)] as Qt
+                        [Kt (B, Nh, Lp, D/Nh)] as Kt
+                        [Vt (B, Nh, Lp, D/Nh)] as Vt
+
+                        Q2 --> trans_q
+                        Kx --> trans_k
+                        Vx --> trans_v
+                        trans_q --> Qt
+                        trans_k --> Kt
+                        trans_v --> Vt
+                    }
+
+                    frame "Scaled Dot Product Attention (prefill)" {
+                        ' transpose
+                        [Kt' (B, Nh, D/Nh, Lp)] as Kt1
+                        () "transpose(2, 3)" as trans_kt <<memops>>
+
+                        Kt --> trans_kt
+                        trans_kt --> Kt1
+
+                        ' matmul
+                        () "matmul(Qt, Kt') / sqrt(D/Nh)" as matmul_q_k <<compute>>
+                        [Attention\nA (B, Nh, Lp, Lp)] as A
+
+                        Qt --> matmul_q_k
+                        Kt1 --> matmul_q_k
+                        matmul_q_k --> A
+
+                        ' mask
+                        database "Const mask matrix\nM (1, 1, Lp, Lp)" as M
+                        () "add(A, M)" as add_mask <<compute>>
+                        [Am (B, Nh, Lp, Lp)] as Am
+
+                        A --> add_mask
+                        M --> add_mask : broadcast
+                        add_mask --> Am
+
+                        ' softmax
+                        () "softmax(Am, dim=-1)" as softmax <<compute>>
+                        [As (B, Nh, Lp, Lp)] as As
+
+                        Am --> softmax
+                        softmax --> As
+
+                        ' matmul
+                        () "matmul(As, Vt)" as matmul_a_v <<compute>>
+                        [Self-Attention\nSA(B, Nh, Lp, D/Nh)] as SA
+
+                        Vt --> matmul_a_v
+                        As --> matmul_a_v
+                        matmul_a_v --> SA
+                    }
+                    ' End of frame "Scaled Dot Product Attention"
+
+                    ' concat heads
+                    () "tranpose(1, 2).contiguous()" as concat_sa <<memops>>
+                    [Self-Attention concatenated\nSAc (B, Lp, Nh, D/Nh)] as SAc
+                    [Self-Attention concatenated\nSAc' (B, Lp, D)] as SAc1
+
+                    SA --> concat_sa
+                    concat_sa --> SAc
+                    SAc --> SAc1 : view(B, Lp, -1)
+
+                    ' Linear
+                    () "Projection A\nlinear(D, D)" as projection_sac <<module>>
+                    [Self-Attention projection\nSAp (B, Lp, D)] as SAp
+
+                    SAc1 --> projection_sac
+                    projection_sac --> SAp
+                }
+                ' End of frame "Grouped Multi-Query Attention"
+            }
+
+            ' Residual after attention
+            () "Attention Residual Add" as attention_residual_add <<compute>>
+            [Attention Residual Output\nHa (B, Lp, D)] as Ha
+            Xi --> attention_residual_add
+            SAp --> attention_residual_add
+
+            attention_residual_add --> Ha
+
+            ' RMSNorm
+            () "FFN Norm\nRMSNorm(D)" as ffn_norm <<module>>
+            [FFN input\nHi (B, Lp, D)] as Hi
+
+            Ha --> ffn_norm
+            ffn_norm --> Hi
+
+            frame "FeedForward prefill" {
+                cloud {
+                    () "Gate Projection\nlinear(D, Dh)" as gate_projection <<module>>
+                    () "Up Projection\nlinear(D, Dh)" as up_projection <<module>>
+                    [Hg (B, Lp, Dh)] as Hg
+                    [Hu (B, Lp, Dh)] as Hu
+
+                    Hi --> gate_projection
+                    gate_projection --> Hg
+                    Hi --> up_projection
+                    up_projection --> Hu
+                }
+
+                () "swish()" as swish <<compute>>
+                [Hs (B, Lp, Dh)] as Hs
+
+                Hg --> swish
+                swish --> Hs
+
+                () "Elem-Wise Mul()" as elem_wise_mul <<compute>>
+                [Hm (B, Lp, Dh)] as Hm
+                Hu --> elem_wise_mul
+                Hs --> elem_wise_mul
+                elem_wise_mul --> Hm
+
+                () "Down Projection\nlinear(Dh, D)" as down_projection <<module>>
+                [Hd (B, Lp, D)] as Hd
+
+                Hm --> down_projection
+                down_projection --> Hd
+            }
+            ' End of frame FeedForward
+
+            ' Residual after FFN
+            () "FNN Residual Add(Hd, Ha)" as ffn_residual_add <<compute>>
+            [FFN Residual Output\nHf (B, Lp, D)] as Hf
+            Ha --> ffn_residual_add
+            Hd --> ffn_residual_add
+            ffn_residual_add --> Hf
+        }
+
+
+        ' Loop TransformerLayer
+        () "Loop through all the layers" as layer_loop
+        [Input Embeddings\nXi (B, Lp, D)] as _Xi
+
+        Hf --> layer_loop
+        layer_loop -> _Xi : "Loop is not finished\n(to the next layer's input)"
+
+    }
+
+    ' Slice the last token
+    () "slice(B, 1, D)" as slice
+    [Hf' (B, 1, D)] as hf1
+    layer_loop --> slice
+    slice --> hf1
+
+    note right of hf1
+        Only the last token is needed in inference
+        other tokens are known information
+    end note
+
+    ' RMSNorm
+    () "Output Norm\nRMSNorm(D)" as output_norm <<module>>
+    [Output Embeddings\nXo (B, 1, D)] as Xo
+
+    hf1 --> output_norm : Loop is finished
+    output_norm --> Xo
+
+    ' Output linear
+    () "Output Linear\nlinear(D, V)" as output_linear <<module>>
+
+    Xo --> output_linear
+}
+
+[Output logits\nLo (B, 1, V)] as Lo
+output_linear --> Lo
+
+() "Sampling algorithm" as sampling <<out-of-scope>>
+[Output tokens\nTo (B, 1)] as To
+Lo --> sampling
+sampling --> To
+
+note right of To
+    As the input tokens of decode phase
+end note
+
+'===============================================================================
+
+frame "Decoder phase (1-token at a time)" {
+
+    [Next token\nTi (B, 1)] as Ti_
+
+    frame "Transformer (decode)" {
+        ' Embeddings
+        () "embedding(V, D)" as embedding_ <<memops>>
+        [Input Embeddings\nXi (B, 1, D)] as Xi_
+
+        Ti_ --> embedding_
+        embedding_ --> Xi_
+
+        frame "TransformerLayer (decode)" {
+            ' RMS Norm
+            () "Attention Norm\nRMSNorm(D)" as attention_norm_ <<module>>
+            [Attention Input\nXi' (B, 1, D)] as Xi1_
+
+            Xi_ --> attention_norm_
+            attention_norm_ --> Xi1_
+
+            frame "Multi-Head Attention (decode)" {
+                frame "Projection (decode)" {
+                    ' Linear projection
+                    () "Projection Q\nlinear(D, D)" as projection_q_ <<module>>
+                    () "Projection K\nlinear(D, D*Nkv/Nh)" as projection_k_ <<module>>
+                    () "Projection V\nlinear(D, D*Nkv/Nh)" as projection_v_ <<module>>
+                    [Q (B, 1, D)] as Q_
+                    [K (B, 1, D*Nkv/Nh)] as K_
+                    [V (B, 1, D*Nkv/Nh)] as V_
+
+                    Xi1_ --> projection_q_
+                    Xi1_ --> projection_k_
+                    Xi1_ --> projection_v_
+
+                    projection_q_ --> Q_
+                    projection_k_ --> K_
+                    projection_v_ --> V_
+
+                    ' Reshape
+                    [Q' (B, 1, Nh, D/Nh)] as Q1_
+                    [K' (B, 1, Nkv, D/Nh)] as K1_
+                    [V' (B, 1, Nkv, D/Nh)] as V1_
+
+                    Q_ --> Q1_ : view
+                    K_ --> K1_ : view
+                    V_ --> V1_ : view
+                }
+                ' End of frame "Projection"
+
+                frame "RoPE (Rotary Positional Embedding) (decode)" {
+                    ' Reshape and unbind XQ and XK to match complex representation
+                    [Q' (B, 1, Nh, D/Nh/2, 2)] as _Q1_
+                    [K' (B, 1, Nkv, D/Nh/2, 2)] as _K1_
+                    Q1_ --> _Q1_ : reshape
+                    K1_ --> _K1_ : reshape
+
+                    () "To complex\nrepresentation\nx.unbind(-1)" as complex_q_ <<memops>>
+                    () "To complex\nrepresentation\nx.unbind(-1)" as complex_k_ <<memops>>
+                    [Qc = Qr + Qi*i\nQr (B, 1, Nh, D/Nh/2)\nQi (B, 1, Nh, D/Nh/2)] as Qc_
+                    [Kc = Kr + Ki*i\nKr (B, 1, Nkv, D/Nh/2)\nKi (B, 1, Nkv, D/Nh/2)] as Kc_
+
+                    _Q1_ --> complex_q_
+                    _K1_ --> complex_k_
+                    complex_q_ --> Qc_
+                    complex_k_ --> Kc_
+
+                    ' RoPE precomputed sin/cos freqs
+                    database "Cos(mθ)\n(1, Lc:Lc+1, 1, D/Nh/2)" as Cos_
+                    database "Sin(mθ)\n(1, Lc:Lc+1, 1, D/Nh/2)" as Sin_
+
+                    ' Apply rotation on complex
+                    () "Broadcast dim=[0,2]\nQr'=Qr*Cos-Qi*Sin\nQi'=Qr*Sin+Qi*Cos" as rotate_q_ <<compute>>
+                    () "Broadcast dim=[0,2]\nKr'=Kr*Cos-Ki*Sin\nKi'=Kr*Sin+Ki*Cos" as rotate_k_ <<compute>>
+
+                    [Qr' (B, 1, Nh, D/Nh/2)\nQi' (B, 1, Nh, D/Nh/2)] as Qc1_
+                    [Kr' (B, 1, Nkv, D/Nh/2)\nKi' (B, 1, Nkv, D/Nh/2)] as Kc1_
+
+                    Qc_ --> rotate_q_
+                    Cos_ --> rotate_q_ : broadcast
+                    Sin_ --> rotate_q_ : broadcast
+                    Kc_ --> rotate_k_
+                    Cos_ --> rotate_k_ : broadcast
+                    Sin_ --> rotate_k_ : broadcast
+                    rotate_q_ --> Qc1_
+                    rotate_k_ --> Kc1_
+
+
+                    ' Stack and flatten (like shuffle cards)
+                    () "stack([Qr', Qi'], dim=-1).flatten(3)" as shuffle_q_ <<memops>>
+                    () "stack([Kr', Ki'], dim=-1).flatten(3)" as shuffle_k_ <<memops>>
+                    [Q'' (B, 1, Nh, D/Nh)] as Q2_
+                    [K'' (B, 1, Nkv, D/Nh)] as K2_
+
+                    Qc1_ --> shuffle_q_
+                    Kc1_ --> shuffle_k_
+                    shuffle_q_ --> Q2_
+                    shuffle_k_ --> K2_
+                }
+                ' End of frame RoPE
+
+                ' append KV cache (per head)
+                () "Append current\ntoken to cache K\n(l, :B, Lc:Lc+1, :, :)" as save_to_cache_k_ <<memops>>
+                () "Append current\ntoken to cache V\n(l, :B, Lc:Lc+1, :, :)" as save_to_cache_v_ <<memops>>
+                K2_ --> save_to_cache_k_
+                V1_ --> save_to_cache_v_
+                save_to_cache_k_ --> cache_k_
+                save_to_cache_v_ --> cache_v_
+
+                ' load full context from cache
+                () "Load full context\nfrom cache K\n(l, :B, :Lc+1, :, :)\nLa=Lc+1" as load_from_cache_k_ <<memops>>
+                () "Load full context\nfrom cache V\n(l, :B, :Lc+1, :, :)\nLa=Lc+1" as load_from_cache_v_ <<memops>>
+                [Full context of K\n(B, Lc+1, Nkv, D/Nh)] as Kf_
+                [Full context of V\n(B, Lc+1, Nkv, D/Nh)] as Vf_
+                save_to_cache_k_ ..> load_from_cache_k_
+                save_to_cache_v_ ..> load_from_cache_v_
+                load_from_cache_k_ --> Kf_
+                load_from_cache_v_ --> Vf_
+                cache_k_ --> load_from_cache_k_
+                cache_v_ --> load_from_cache_v_
+
+                frame "Grouped Multi-Query Attention (decode)" {
+
+                    frame "Repeat KV to match the size of Q (decode)" {
+                        ' Repeat K and V for GQA (grouped multi-query attention)
+                        () "repeat_interleave\n(K'', repeats=Nh/Nkv, dim=2)" as repeat_k_ <<memops>>
+                        () "repeat_interleave\n(V', repeats=Nh/Nkv, dim=2)" as repeat_v_ <<memops>>
+                        [Kx (B, Lc+1, Nh, D/Nh)] as Kx_
+                        [Vx (B, Lc+1, Nh, D/Nh)] as Vx_
+
+                        Kf_ --> repeat_k_
+                        Vf_ --> repeat_v_
+                        repeat_k_ --> Kx_
+                        repeat_v_ --> Vx_
+                    }
+
+                    cloud {
+                        ' Transpose
+                        () "transpose(1, 2)" as trans_q_ <<memops>>
+                        () "transpose(1, 2)" as trans_k_ <<memops>>
+                        () "transpose(1, 2)" as trans_v_ <<memops>>
+
+                        [Qt (B, Nh, 1, D/Nh)] as Qt_
+                        [Kt (B, Nh, Lc+1, D/Nh)] as Kt_
+                        [Vt (B, Nh, Lc+1, D/Nh)] as Vt_
+
+                        Q2_ --> trans_q_
+                        Kx_ --> trans_k_
+                        Vx_ --> trans_v_
+                        trans_q_ --> Qt_
+                        trans_k_ --> Kt_
+                        trans_v_ --> Vt_
+                    }
+
+                    frame "Scaled Dot Product Attention (decode)" {
+                        ' transpose
+                        [Kt' (B, Nh, D/Nh, Lc+1)] as Kt1_
+                        () "transpose(2, 3)" as trans_kt_ <<memops>>
+
+                        Kt_ --> trans_kt_
+                        trans_kt_ --> Kt1_
+
+                        ' matmul
+                        () "matmul(Qt, Kt') / sqrt(D/Nh)" as matmul_q_k_ <<compute>>
+                        [Attention\nA (B, Nh, 1, Lc+1)] as A_
+
+                        Qt_ --> matmul_q_k_
+                        Kt1_ --> matmul_q_k_
+                        matmul_q_k_ --> A_
+
+                        ' mask
+                        database "Const mask matrix\nM (1, 1, Lc:Lc+1, Lc+1)" as M_
+                        () "add(A, M)" as add_mask_ <<compute>>
+                        [Am (B, Nh, 1, Lc+1)] as Am_
+
+                        A_ --> add_mask_
+                        M_ --> add_mask_ : broadcast
+                        add_mask_ --> Am_
+
+                        ' softmax
+                        () "softmax(Am, dim=-1)" as softmax_ <<compute>>
+                        [As (B, Nh, 1, Lc+1)] as As_
+
+                        Am_ --> softmax_
+                        softmax_ --> As_
+
+
+                        ' matmul
+                        () "matmul(As, Vt)" as matmul_a_v_ <<compute>>
+                        [Self-Attention\nSA(B, Nh, 1, D/Nh)] as SA_
+
+                        Vt_ --> matmul_a_v_
+                        As_ --> matmul_a_v_
+                        matmul_a_v_ --> SA_
+                    }
+                    ' End of frame "Scaled Dot Product Attention"
+
+                    ' concat heads
+                    () "tranpose(1, 2).contiguous()" as concat_sa_ <<memops>>
+                    [Self-Attention concatenated\nSAc (B, 1, Nh, D/Nh)] as SAc_
+                    [Self-Attention concatenated\nSAc' (B, 1, D)] as SAc1_
+
+                    SA_ --> concat_sa_
+                    concat_sa_ --> SAc_
+                    SAc_ --> SAc1_ : view(B, 1, -1)
+
+                    ' Linear
+                    () "Projection A\nlinear(D, D)" as projection_sac_ <<module>>
+                    [Self-Attention projection\nSAp (B, 1, D)] as SAp_
+
+                    SAc1_ --> projection_sac_
+                    projection_sac_ --> SAp_
+                }
+                ' End of frame "Grouped Multi-Query Attention"
+            }
+
+            ' Residual after attention
+            () "Attention Residual Add" as attention_residual_add_ <<compute>>
+            [Attention Residual Output\nHa (B, 1, D)] as Ha_
+            Xi_ --> attention_residual_add_
+            SAp_ --> attention_residual_add_
+
+            attention_residual_add_ --> Ha_
+
+            ' RMSNorm
+            () "FFN Norm\nRMSNorm(D)" as ffn_norm_ <<module>>
+            [FFN input\nHi (B, 1, D)] as Hi_
+
+            Ha_ --> ffn_norm_
+            ffn_norm_ --> Hi_
+
+            frame "FeedForward (decode)" {
+                cloud {
+                    () "Gate Projection\nlinear(D, Dh)" as gate_projection_ <<module>>
+                    () "Up Projection\nlinear(D, Dh)" as up_projection_ <<module>>
+                    [Hg (B, 1, Dh)] as Hg_
+                    [Hu (B, 1, Dh)] as Hu_
+
+                    Hi_ --> gate_projection_
+                    gate_projection_ --> Hg_
+                    Hi_ --> up_projection_
+                    up_projection_ --> Hu_
+                }
+
+                () "swish()" as swish_ <<compute>>
+                [Hs (B, 1, Dh)] as Hs_
+
+                Hg_ --> swish_
+                swish_ --> Hs_
+
+                () "Elem-Wise Mul()" as elem_wise_mul_ <<compute>>
+                [Hm (B, 1, Dh)] as Hm_
+                Hu_ --> elem_wise_mul_
+                Hs_ --> elem_wise_mul_
+                elem_wise_mul_ --> Hm_
+
+                () "Down Projection\nlinear(Dh, D)" as down_projection_ <<module>>
+                [Hd (B, 1, D)] as Hd_
+
+                Hm_ --> down_projection_
+                down_projection_ --> Hd_
+            }
+            ' End of frame FeedForward
+
+            ' Residual after FFN
+            () "FNN Residual Add(Hd, Ha)" as ffn_residual_add_ <<compute>>
+            [FFN Residual Output\nHf (B, 1, D)] as Hf_
+            Ha_ --> ffn_residual_add_
+            Hd_ --> ffn_residual_add_
+            ffn_residual_add_ --> Hf_
+        }
+
+
+        ' loop TransformerLayer
+        () "Loop through all the layers" as layer_loop_
+        [Input Embeddings\nXi (B, 1, D)] as _Xi_
+
+        Hf_ --> layer_loop_
+        layer_loop_ -> _Xi_ : "Loop is not finished\n(to the next layer's input)"
+    }
+
+    ' RMSNorm
+    () "Output Norm\nRMSNorm(D)" as output_norm_ <<module>>
+    [Output Embeddings\nXo (B, 1, D)] as Xo_
+
+    layer_loop_ --> output_norm_ : Loop is finished
+    output_norm_ --> Xo_
+
+    ' Output linear
+    () "Output Linear\nlinear(D, V)" as output_linear_ <<module>>
+
+    Xo_ --> output_linear_
+}
+
+[Output logits\nLo (B, 1, V)] as Lo_
+output_linear_ --> Lo_
+
+() "Sampling algorithm" as sampling_ <<out-of-scope>>
+[Output tokens\nTo (B, 1)] as To_
+Lo_ --> sampling_
+sampling_ --> To_
+
+note right of To_
+    As the input tokens of decode phase.
+    Because the KV cache already saved the full context of previous tokens,
+    only one token is needed for the next decode iteration.
+end note
+
+@enduml

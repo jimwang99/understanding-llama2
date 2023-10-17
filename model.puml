@@ -16,6 +16,7 @@ skinparam component {
 header
 batch = B
 seq_len = L
+max_seq_len = Lm
 dim = D
 n_heads = Nh
 n_kv_heads = Nkv
@@ -79,18 +80,18 @@ frame Transformer {
 
             frame "RoPE (Rotary Positional Embedding)" {
                 ' Reshape and unbind XQ and XK to match complex representation
-                [Q' (B, L, Nh, D/Nh/2, 2)] as Q1_
-                [K' (B, L, Nkv, D/Nh/2, 2)] as K1_
-                Q1 --> Q1_ : reshape
-                K1 --> K1_ : reshape
+                [Q' (B, L, Nh, D/Nh/2, 2)] as _Q1
+                [K' (B, L, Nkv, D/Nh/2, 2)] as _K1
+                Q1 --> _Q1 : reshape
+                K1 --> _K1 : reshape
 
                 () "To complex\nrepresentation\nx.unbind(-1)" as complex_q <<memops>>
                 () "To complex\nrepresentation\nx.unbind(-1)" as complex_k <<memops>>
                 [Qc = Qr + Qi*i\nQr (B, L, Nh, D/Nh/2)\nQi (B, L, Nh, D/Nh/2)] as Qc
                 [Kc = Kr + Ki*i\nKr (B, L, Nkv, D/Nh/2)\nKi (B, L, Nkv, D/Nh/2)] as Kc
 
-                Q1_ --> complex_q
-                K1_ --> complex_k
+                _Q1 --> complex_q
+                _K1 --> complex_k
                 complex_q --> Qc
                 complex_k --> Kc
 
@@ -130,8 +131,8 @@ frame Transformer {
 
             frame "Grouped Multi-Query Attention" {
 
-                frame "Expand KV to match the size of Q" {
-                    ' Expand K and V for GQA (grouped multi-query attention)
+                frame "Repeat KV to match the size of Q" {
+                    ' Repeat K and V for GQA (grouped multi-query attention)
                     () "repeat_interleave\n(K'', repeats=Nh/Nkv, dim=2)" as repeat_k <<memops>>
                     () "repeat_interleave\n(V', repeats=Nh/Nkv, dim=2)" as repeat_v <<memops>>
                     [Kx (B, L, Nh, D/Nh)] as Kx
@@ -280,11 +281,11 @@ frame Transformer {
 
 
     ' Loop TransformerLayer
-    () "(idx < Nl)?" as layer_loop
-    ["Input Embeddings\nXi (B, L, D)"] as _Xi
+    () "Looping through the layers" as layer_loop
+    [Input Embeddings\nXi (B, L, D)] as _Xi
 
     Hf --> layer_loop
-    layer_loop -> _Xi : Yes
+    layer_loop -> _Xi : Loop is not finished\n(to the next layer's input)
 
 }
 
@@ -292,15 +293,15 @@ frame Transformer {
 () "Output Norm\nRMSNorm(D)" as output_norm <<module>>
 [Output Embeddings\nXo (B, L, D)] as Xo
 
-layer_loop --> output_norm : No
+layer_loop --> output_norm : Loop is finished
 output_norm --> Xo
 
 ' Output linear
 () "Output Linear\nlinear(D, V)" as output_linear <<module>>
-[Output Tokens\nTo (B, L, V)] as To
+[Output Logits\nLo (B, L|1, V)] as Lo
 
 Xo --> output_linear
-output_linear --> To
+output_linear --> Lo
 
 note right of embedding
 A lookup table with 1 as input size, D as output size.
@@ -406,10 +407,23 @@ From embedding to vocabulary probability. Each number
 in the last domain represents the probability of corresponding token
 end note
 
+note right of Lo
+Output of the model is a list of logits (last dimension, V) that
+represent the values associated with every tokens in the vocaburary.
+Then we use sampling algorithm to pick the next token.
+
+The L dimension (second to last) actually means the model predicted
+next token of every position of the input sequence, and it's used in
+training mode. If in inference mode, we only need the last one, which
+is the future (unknown) token.
+end note
+
 
 note right of _Xi
 Goes back to the input of Transformer Layer.
 > Drawing the arrow will mess up PlantUML's engine
 > and make this diagram unreadable, therefore it's not shown here.
 end note
+
+
 @enduml
